@@ -1,0 +1,602 @@
+---
+title: "Laboratorio 1: análisis inicial de dos series de tiempo"
+subtitle: "Ingreso de viajeros internacionales a Guatemala"
+author: "Daniel Sarmiento"
+date: "`r format(Sys.Date(), '%d/%m/%Y')`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+    latex_engine: xelatex
+  html_document:
+    toc: true
+    number_sections: true
+---
+
+```{r configuracion, include=FALSE}
+paquetes <- c(
+  "readxl", "dplyr", "tidyr", "lubridate", "ggplot2",
+  "forecast", "tseries", "knitr", "scales"
+)
+
+faltantes <- paquetes[!vapply(paquetes, requireNamespace, logical(1), quietly = TRUE)]
+if (length(faltantes) > 0) {
+  install.packages(faltantes, dependencies = TRUE)
+}
+
+invisible(lapply(paquetes, library, character.only = TRUE))
+
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 9,
+  fig.height = 4.8,
+  dpi = 300
+)
+
+theme_set(
+  theme_minimal(base_size = 11) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      plot.subtitle = element_text(color = "gray35"),
+      panel.grid.minor = element_blank()
+    )
+)
+
+meses_es <- c(
+  "enero", "febrero", "marzo", "abril", "mayo", "junio",
+  "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"
+)
+
+fecha_es <- function(x) {
+  paste(meses_es[lubridate::month(x)], lubridate::year(x))
+}
+
+numero <- function(x, decimales = 0) {
+  format(
+    round(x, decimales),
+    big.mark = ",",
+    decimal.mark = ".",
+    scientific = FALSE,
+    trim = TRUE,
+    nsmall = decimales
+  )
+}
+
+porcentaje <- function(x, decimales = 2) {
+  paste0(numero(x, decimales), "%")
+}
+
+interpretar_fuerza <- function(x) {
+  if (x >= 0.64) {
+    "fuerte"
+  } else if (x >= 0.30) {
+    "moderada"
+  } else {
+    "débil"
+  }
+}
+```
+
+# Preparación de los datos
+
+```{r importar-y-limpiar}
+archivo <- "Base_Migracion_2009-2026jun.xlsx"
+
+# Si el Excel no está en la carpeta activa, permite seleccionarlo.
+if (!file.exists(archivo)) {
+  archivo <- file.choose()
+}
+
+if (!file.exists(archivo)) {
+  stop(
+    paste0(
+      "No se encontró Base_Migracion_2009-2026jun.xlsx. ",
+      "Descomprima la carpeta completa y no separe el Excel del R Markdown."
+    )
+  )
+}
+
+datos_originales <- readxl::read_excel(archivo, sheet = "Datos")
+
+calidad <- tibble(
+  Indicador = c(
+    "Filas originales",
+    "Valores faltantes",
+    "Filas duplicadas completas",
+    "Valores negativos en Viajero"
+  ),
+  Resultado = c(
+    nrow(datos_originales),
+    sum(is.na(datos_originales)),
+    sum(duplicated(datos_originales)),
+    sum(datos_originales$Viajero < 0, na.rm = TRUE)
+  )
+)
+
+datos <- datos_originales %>%
+  mutate(
+    Fecha = as.Date(sprintf("%04d-%02d-01", Año, `Mes cod`))
+  ) %>%
+  filter(`Tipo de Viajero` %in% c("Turista", "Excursionista"))
+
+calendario <- tibble(
+  Fecha = seq.Date(min(datos$Fecha), max(datos$Fecha), by = "month")
+)
+
+total_mensual <- datos %>%
+  group_by(Fecha) %>%
+  summarise(Viajeros = sum(Viajero, na.rm = TRUE), .groups = "drop") %>%
+  right_join(calendario, by = "Fecha") %>%
+  mutate(Viajeros = replace_na(Viajeros, 0)) %>%
+  arrange(Fecha)
+
+aerea_mensual <- datos %>%
+  filter(Vía == "Aérea") %>%
+  group_by(Fecha) %>%
+  summarise(Viajeros = sum(Viajero, na.rm = TRUE), .groups = "drop") %>%
+  right_join(calendario, by = "Fecha") %>%
+  mutate(Viajeros = replace_na(Viajeros, 0)) %>%
+  arrange(Fecha)
+
+n_total <- nrow(total_mensual)
+n_entrenamiento <- floor(0.70 * n_total)
+
+agregar_periodo <- function(tabla) {
+  tabla %>%
+    mutate(
+      Periodo = if_else(
+        row_number() <= n_entrenamiento,
+        "Entrenamiento",
+        "Prueba"
+      )
+    )
+}
+
+total_mensual <- agregar_periodo(total_mensual)
+aerea_mensual <- agregar_periodo(aerea_mensual)
+
+crear_ts <- function(tabla, periodo = c("completo", "entrenamiento", "prueba")) {
+  periodo <- match.arg(periodo)
+  seleccion <- switch(
+    periodo,
+    completo = tabla,
+    entrenamiento = filter(tabla, Periodo == "Entrenamiento"),
+    prueba = filter(tabla, Periodo == "Prueba")
+  )
+
+  ts(
+    seleccion$Viajeros,
+    start = c(year(min(seleccion$Fecha)), month(min(seleccion$Fecha))),
+    frequency = 12
+  )
+}
+
+ts_total_completo <- crear_ts(total_mensual, "completo")
+ts_total_train <- crear_ts(total_mensual, "entrenamiento")
+ts_total_test <- crear_ts(total_mensual, "prueba")
+
+ts_aerea_completo <- crear_ts(aerea_mensual, "completo")
+ts_aerea_train <- crear_ts(aerea_mensual, "entrenamiento")
+ts_aerea_test <- crear_ts(aerea_mensual, "prueba")
+
+inicio_prueba <- min(total_mensual$Fecha[total_mensual$Periodo == "Prueba"])
+fin_entrenamiento <- max(total_mensual$Fecha[total_mensual$Periodo == "Entrenamiento"])
+```
+
+El archivo contiene `r numero(nrow(datos_originales))` registros. Para mantener
+comparabilidad durante todo el periodo se utilizaron únicamente las categorías
+**Turista** y **Excursionista**. La categoría “Viajero” no se incluyó porque su
+definición cambia entre 2022 y 2023; utilizarla produciría una caída artificial
+que no representa el comportamiento real del turismo.
+
+```{r tabla-calidad}
+knitr::kable(
+  calidad,
+  format.args = list(big.mark = ","),
+  caption = "Verificaciones iniciales de calidad"
+)
+```
+
+No hay valores faltantes, filas duplicadas completas ni cantidades negativas.
+Los valores muy bajos de 2020 no se eliminaron como atípicos, pues corresponden
+a la interrupción real de los viajes durante la pandemia.
+
+## División cronológica
+
+La división se realizó respetando el orden temporal: `r n_entrenamiento` meses
+(`r porcentaje(100 * n_entrenamiento / n_total, 1)`) para entrenamiento y
+`r n_total - n_entrenamiento` meses
+(`r porcentaje(100 * (n_total - n_entrenamiento) / n_total, 1)`) para prueba.
+El entrenamiento termina en `r fecha_es(fin_entrenamiento)` y la prueba comienza
+en `r fecha_es(inicio_prueba)`. No se utilizó una selección aleatoria porque
+mezclar observaciones futuras con observaciones pasadas causaría fuga de
+información.
+
+```{r tabla-cobertura}
+cobertura <- tibble(
+  Conjunto = c("Serie completa", "Entrenamiento", "Prueba"),
+  Inicio = c(
+    min(total_mensual$Fecha),
+    min(total_mensual$Fecha[total_mensual$Periodo == "Entrenamiento"]),
+    min(total_mensual$Fecha[total_mensual$Periodo == "Prueba"])
+  ),
+  Fin = c(
+    max(total_mensual$Fecha),
+    max(total_mensual$Fecha[total_mensual$Periodo == "Entrenamiento"]),
+    max(total_mensual$Fecha[total_mensual$Periodo == "Prueba"])
+  ),
+  Meses = c(n_total, n_entrenamiento, n_total - n_entrenamiento),
+  Frecuencia = rep("12 observaciones por año", 3)
+) %>%
+  mutate(
+    Inicio = fecha_es(Inicio),
+    Fin = fecha_es(Fin)
+  )
+
+knitr::kable(cobertura, caption = "Cobertura temporal de las series")
+```
+
+```{r funciones-analisis}
+resumen_serie <- function(tabla, nombre) {
+  tibble(
+    Serie = nombre,
+    Media = mean(tabla$Viajeros),
+    Mediana = median(tabla$Viajeros),
+    `Desviación estándar` = sd(tabla$Viajeros),
+    Mínimo = min(tabla$Viajeros),
+    `Fecha del mínimo` = fecha_es(tabla$Fecha[which.min(tabla$Viajeros)]),
+    Máximo = max(tabla$Viajeros),
+    `Fecha del máximo` = fecha_es(tabla$Fecha[which.max(tabla$Viajeros)])
+  )
+}
+
+graficar_division <- function(tabla, titulo, color) {
+  ggplot(tabla, aes(Fecha, Viajeros)) +
+    annotate(
+      "rect",
+      xmin = as.Date("2020-03-01"),
+      xmax = as.Date("2021-03-01"),
+      ymin = -Inf,
+      ymax = Inf,
+      fill = "#E76F51",
+      alpha = 0.10
+    ) +
+    geom_line(color = color, linewidth = 0.65) +
+    geom_vline(
+      xintercept = inicio_prueba,
+      color = "#D1495B",
+      linetype = "dashed",
+      linewidth = 0.7
+    ) +
+    annotate(
+      "text",
+      x = as.Date("2020-09-01"),
+      y = Inf,
+      label = "Pandemia",
+      vjust = 1.5,
+      color = "#A33A2B",
+      size = 3.3
+    ) +
+    labs(
+      title = titulo,
+      subtitle = "Línea roja: inicio del conjunto de prueba",
+      x = NULL,
+      y = "Viajeros"
+    ) +
+    scale_y_continuous(labels = scales::label_number(big.mark = ","))
+}
+
+analisis_inicial <- function(serie_train) {
+  descomposicion <- stl(
+    serie_train,
+    s.window = "periodic",
+    robust = TRUE
+  )
+
+  componentes <- as.data.frame(descomposicion$time.series)
+  fuerza_estacional <- max(
+    0,
+    1 - var(componentes$remainder, na.rm = TRUE) /
+      var(componentes$seasonal + componentes$remainder, na.rm = TRUE)
+  )
+  fuerza_tendencia <- max(
+    0,
+    1 - var(componentes$remainder, na.rm = TRUE) /
+      var(componentes$trend + componentes$remainder, na.rm = TRUE)
+  )
+
+  lambda <- forecast::BoxCox.lambda(
+    serie_train,
+    method = "guerrero",
+    lower = -1,
+    upper = 2
+  )
+
+  transformar <- abs(lambda - 1) > 0.20
+  serie_varianza <- if (transformar) {
+    forecast::BoxCox(serie_train, lambda)
+  } else {
+    serie_train
+  }
+
+  adf_original <- tseries::adf.test(
+    serie_varianza,
+    alternative = "stationary"
+  )
+
+  D <- forecast::nsdiffs(
+    serie_varianza,
+    m = 12,
+    test = "ocsb",
+    max.D = 1
+  )
+
+  serie_sin_estacionalidad <- if (D > 0) {
+    diff(serie_varianza, lag = 12, differences = D)
+  } else {
+    serie_varianza
+  }
+
+  d <- forecast::ndiffs(
+    serie_sin_estacionalidad,
+    alpha = 0.05,
+    test = "adf",
+    max.d = 2
+  )
+
+  serie_estacionaria <- if (d > 0) {
+    diff(serie_sin_estacionalidad, differences = d)
+  } else {
+    serie_sin_estacionalidad
+  }
+
+  adf_final <- tseries::adf.test(
+    serie_estacionaria,
+    alternative = "stationary"
+  )
+
+  list(
+    stl = descomposicion,
+    fuerza_estacional = fuerza_estacional,
+    fuerza_tendencia = fuerza_tendencia,
+    lambda = lambda,
+    transformar = transformar,
+    serie_varianza = serie_varianza,
+    adf_original = adf_original,
+    D = D,
+    d = d,
+    serie_estacionaria = serie_estacionaria,
+    adf_final = adf_final
+  )
+}
+
+caida_2020 <- function(tabla) {
+  totales <- tabla %>%
+    mutate(Año = year(Fecha)) %>%
+    filter(Año %in% c(2019, 2020)) %>%
+    group_by(Año) %>%
+    summarise(Total = sum(Viajeros), .groups = "drop")
+
+  100 * (totales$Total[totales$Año == 2020] /
+           totales$Total[totales$Año == 2019] - 1)
+}
+
+analisis_total <- analisis_inicial(ts_total_train)
+analisis_aerea <- analisis_inicial(ts_aerea_train)
+
+caida_total <- caida_2020(total_mensual)
+caida_aerea <- caida_2020(aerea_mensual)
+
+mensaje_transformacion_total <- if (analisis_total$transformar) {
+  paste0(
+    "Como este valor está alejado de 1, se aplica una transformación Box-Cox ",
+    "antes de estudiar la estacionariedad en media."
+  )
+} else {
+  paste0(
+    "Como este valor es cercano a 1, no se considera necesaria una ",
+    "transformación para estabilizar la varianza."
+  )
+}
+
+mensaje_adf_total <- if (analisis_total$adf_original$p.value < 0.05) {
+  paste0(
+    "Al nivel de significancia de 5%, se rechaza la hipótesis nula de raíz ",
+    "unitaria. Sin embargo, la ruptura de 2020 y el patrón estacional todavía ",
+    "deben considerarse."
+  )
+} else {
+  paste0(
+    "Al nivel de significancia de 5%, no se rechaza la hipótesis nula de raíz ",
+    "unitaria; existe evidencia de no estacionariedad en media."
+  )
+}
+
+mensaje_adf_final_total <- if (analisis_total$adf_final$p.value < 0.05) {
+  paste0(
+    "Se rechaza la hipótesis nula de raíz unitaria, por lo que la serie ",
+    "diferenciada puede tratarse como estacionaria en media para la etapa de ",
+    "modelado."
+  )
+} else {
+  paste0(
+    "Todavía no se rechaza la hipótesis nula de raíz unitaria. Antes de modelar ",
+    "sería necesario revisar la ruptura estructural de 2020 o incorporar ",
+    "intervenciones, en vez de diferenciar indefinidamente."
+  )
+}
+
+mensaje_transformacion_aerea <- if (analisis_aerea$transformar) {
+  paste0(
+    "Al estar alejado de 1, se utiliza una transformación Box-Cox para ",
+    "estabilizar la varianza."
+  )
+} else {
+  paste0(
+    "Al ser cercano a 1, no se requiere una transformación para estabilizar ",
+    "la varianza."
+  )
+}
+
+mensaje_adf_aerea <- if (analisis_aerea$adf_original$p.value < 0.05) {
+  paste0(
+    "Con un nivel de significancia de 5%, se rechaza la hipótesis nula de raíz ",
+    "unitaria, aunque todavía se debe considerar la estacionalidad y la ruptura ",
+    "de 2020."
+  )
+} else {
+  paste0(
+    "Con un nivel de significancia de 5%, no se rechaza la hipótesis nula de ",
+    "raíz unitaria; la serie presenta evidencia de no estacionariedad en media."
+  )
+}
+
+mensaje_adf_final_aerea <- if (analisis_aerea$adf_final$p.value < 0.05) {
+  paste0(
+    "Se rechaza la hipótesis nula de raíz unitaria. La serie transformada y ",
+    "diferenciada puede utilizarse como base para seleccionar los parámetros ",
+    "de un modelo ARIMA."
+  )
+} else {
+  paste0(
+    "No se rechaza la hipótesis nula de raíz unitaria. Se recomienda revisar ",
+    "el tratamiento de la ruptura estructural antes de aumentar el número de ",
+    "diferencias."
+  )
+}
+```
+
+
+# Serie 1: total mensual de viajeros internacionales
+
+## Inicio, fin y frecuencia
+
+La serie completa comienza en `r fecha_es(min(total_mensual$Fecha))` y termina
+en `r fecha_es(max(total_mensual$Fecha))`. Contiene `r nrow(total_mensual)`
+observaciones mensuales y tiene frecuencia 12. Para el análisis y la selección
+posterior de modelos se utiliza el tramo de entrenamiento, desde
+`r fecha_es(min(total_mensual$Fecha))` hasta
+`r fecha_es(fin_entrenamiento)`.
+
+```{r resumen-total}
+tabla_resumen_total <- resumen_serie(
+  total_mensual,
+  "Total mensual"
+) %>%
+  mutate(
+    across(
+      c(Media, Mediana, `Desviación estándar`, Mínimo, Máximo),
+      ~ numero(.x, 0)
+    )
+  )
+
+knitr::kable(
+  tabla_resumen_total,
+  caption = "Estadísticas descriptivas: total mensual"
+)
+```
+
+## Gráfico e interpretación inicial
+
+```{r grafico-total}
+graficar_division(
+  total_mensual,
+  "Total mensual de turistas y excursionistas",
+  "#1D5D7A"
+)
+```
+
+A primera vista se observa una tendencia creciente desde 2009 hasta 2019,
+acompañada por picos que se repiten aproximadamente en los mismos meses de cada
+año. El máximo de la serie ocurrió en
+`r tabla_resumen_total[["Fecha del máximo"]]`, con
+`r tabla_resumen_total[["Máximo"]]` viajeros. Después aparece una ruptura
+abrupta en 2020: el total anual disminuyó
+`r porcentaje(abs(caida_total), 2)` respecto de 2019. El mínimo se registró en
+`r tabla_resumen_total[["Fecha del mínimo"]]`, con
+`r tabla_resumen_total[["Mínimo"]]` viajeros. Esta caída no es una fluctuación
+ordinaria ni un error de captura, sino un cambio estructural asociado con la
+pandemia.
+
+## Descomposición
+
+```{r descomposicion-total, fig.height=6.5}
+autoplot(analisis_total$stl) +
+  labs(
+    title = "Descomposición STL del total mensual",
+    subtitle = "Calculada únicamente con el conjunto de entrenamiento",
+    x = NULL
+  )
+```
+
+La descomposición separa la serie en tendencia, componente estacional y
+residuo. La fuerza estimada de la tendencia es
+`r numero(analisis_total$fuerza_tendencia, 3)`, por lo que se clasifica como
+`r interpretar_fuerza(analisis_total$fuerza_tendencia)`. La fuerza estacional
+es `r numero(analisis_total$fuerza_estacional, 3)`, correspondiente a una
+estacionalidad `r interpretar_fuerza(analisis_total$fuerza_estacional)`.
+Por tanto, la serie no mantiene una media constante: cambia por el crecimiento
+previo a 2020, por el patrón mensual y por la ruptura de la pandemia.
+
+## Estacionariedad en varianza y transformación
+
+El método de Guerrero estima
+\(\lambda = `r numero(analisis_total$lambda, 3)`\).
+`r mensaje_transformacion_total`
+Una transformación puede estabilizar fluctuaciones que dependen del nivel,
+pero no elimina la ruptura estructural de 2020; esa observación debe conservarse
+y considerarse al modelar.
+
+## Autocorrelación y estacionariedad en media
+
+```{r acf-total-original}
+forecast::ggAcf(
+  analisis_total$serie_varianza,
+  lag.max = 36
+) +
+  labs(
+    title = "ACF del total mensual antes de diferenciar",
+    subtitle = "Serie de entrenamiento ajustada en varianza",
+    x = "Rezago",
+    y = "Autocorrelación"
+  )
+```
+
+La persistencia de autocorrelaciones significativas en varios rezagos indica
+que las observaciones dependen fuertemente de sus valores anteriores. Los
+rezagos cercanos a 12, 24 y 36 permiten evaluar la repetición anual. Este
+comportamiento, junto con la tendencia observada, impide asumir una media
+constante.
+
+La prueba Dickey-Fuller aumentada produce un valor \(p\) de
+`r numero(analisis_total$adf_original$p.value, 4)` antes de diferenciar.
+`r mensaje_adf_total`
+
+Los procedimientos `ndiffs()` y `nsdiffs()` recomiendan
+`r analisis_total$d` diferencia(s) regular(es) y
+`r analisis_total$D` diferencia(s) estacional(es) de periodo 12.
+
+```{r acf-total-final}
+forecast::ggAcf(
+  analisis_total$serie_estacionaria,
+  lag.max = 36
+) +
+  labs(
+    title = "ACF del total mensual después de diferenciar",
+    subtitle = paste0(
+      "d = ", analisis_total$d,
+      "; D = ", analisis_total$D,
+      "; periodo estacional = 12"
+    ),
+    x = "Rezago",
+    y = "Autocorrelación"
+  )
+```
+
+Después de aplicar las diferencias recomendadas, la prueba ADF obtiene un valor
+\(p\) de `r numero(analisis_total$adf_final$p.value, 4)`.
+`r mensaje_adf_final_total`
+
