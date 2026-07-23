@@ -600,3 +600,128 @@ Después de aplicar las diferencias recomendadas, la prueba ADF obtiene un valor
 \(p\) de `r numero(analisis_total$adf_final$p.value, 4)`.
 `r mensaje_adf_final_total`
 
+# Serie 2: viajeros mensuales por vía aérea
+
+## Inicio, fin y frecuencia
+
+La serie aérea completa cubre desde
+`r fecha_es(min(aerea_mensual$Fecha))` hasta
+`r fecha_es(max(aerea_mensual$Fecha))`, contiene
+`r nrow(aerea_mensual)` observaciones y tiene frecuencia 12. El análisis se
+realiza con los `r n_entrenamiento` meses del conjunto de entrenamiento.
+
+```{r resumen-aerea}
+tabla_resumen_aerea <- resumen_serie(
+  aerea_mensual,
+  "Vía aérea"
+) %>%
+  mutate(
+    across(
+      c(Media, Mediana, `Desviación estándar`, Mínimo, Máximo),
+      ~ numero(.x, 0)
+    )
+  )
+
+knitr::kable(
+  tabla_resumen_aerea,
+  caption = "Estadísticas descriptivas: vía aérea"
+)
+```
+
+## Gráfico e interpretación inicial
+
+```{r grafico-aerea}
+graficar_division(
+  aerea_mensual,
+  "Ingreso mensual de viajeros por vía aérea",
+  "#3A7D44"
+)
+```
+
+La vía aérea también presenta crecimiento hasta 2019 y oscilaciones anuales.
+Su máximo ocurrió en `r tabla_resumen_aerea[["Fecha del máximo"]]`, con
+`r tabla_resumen_aerea[["Máximo"]]` viajeros. En 2020 el total anual aéreo cayó
+`r porcentaje(abs(caida_aerea), 2)` en comparación con 2019. El punto mínimo se
+observó en `r tabla_resumen_aerea[["Fecha del mínimo"]]`, con apenas
+`r tabla_resumen_aerea[["Mínimo"]]` viajeros, lo cual muestra el efecto inmediato
+del cierre y la restricción de vuelos.
+
+## Descomposición
+
+```{r descomposicion-aerea, fig.height=6.5}
+autoplot(analisis_aerea$stl) +
+  labs(
+    title = "Descomposición STL de la vía aérea",
+    subtitle = "Calculada únicamente con el conjunto de entrenamiento",
+    x = NULL
+  )
+```
+
+La fuerza de la tendencia es
+`r numero(analisis_aerea$fuerza_tendencia, 3)`, clasificada como
+`r interpretar_fuerza(analisis_aerea$fuerza_tendencia)`. La fuerza de la
+estacionalidad es `r numero(analisis_aerea$fuerza_estacional, 3)`, por lo que el
+componente estacional se clasifica como
+`r interpretar_fuerza(analisis_aerea$fuerza_estacional)`. La tendencia creciente
+previa a 2020 y la caída extraordinaria durante la pandemia demuestran que la
+media no es constante a lo largo del entrenamiento.
+
+## Estacionariedad en varianza y transformación
+
+Para la vía aérea, el método de Guerrero estima
+\(\lambda = `r numero(analisis_aerea$lambda, 3)`\).
+`r mensaje_transformacion_aerea`
+La transformación no debe interpretarse como una corrección de la pandemia:
+la caída de 2020 es información sustantiva y no un valor defectuoso.
+
+## Autocorrelación y estacionariedad en media
+
+```{r acf-aerea-original}
+forecast::ggAcf(
+  analisis_aerea$serie_varianza,
+  lag.max = 36
+) +
+  labs(
+    title = "ACF de la vía aérea antes de diferenciar",
+    subtitle = "Serie de entrenamiento ajustada en varianza",
+    x = "Rezago",
+    y = "Autocorrelación"
+  )
+```
+
+La ACF permite examinar la persistencia entre meses consecutivos y la repetición
+del patrón anual. Si las barras disminuyen lentamente y varios rezagos siguen
+siendo significativos, la serie no es estacionaria en media. Los rezagos
+múltiplos de 12 muestran cuánto permanece la dependencia estacional.
+
+Antes de diferenciar, la prueba ADF obtiene un valor \(p\) de
+`r numero(analisis_aerea$adf_original$p.value, 4)`.
+`r mensaje_adf_aerea`
+
+Para estabilizar la media se recomiendan
+`r analisis_aerea$d` diferencia(s) regular(es) y
+`r analisis_aerea$D` diferencia(s) estacional(es) de periodo 12.
+
+```{r acf-aerea-final}
+forecast::ggAcf(
+  analisis_aerea$serie_estacionaria,
+  lag.max = 36
+) +
+  labs(
+    title = "ACF de la vía aérea después de diferenciar",
+    subtitle = paste0(
+      "d = ", analisis_aerea$d,
+      "; D = ", analisis_aerea$D,
+      "; periodo estacional = 12"
+    ),
+    x = "Rezago",
+    y = "Autocorrelación"
+  )
+```
+
+Después de diferenciar, el valor \(p\) de la prueba ADF es
+`r numero(analisis_aerea$adf_final$p.value, 4)`.
+`r mensaje_adf_final_aerea`
+
+
+
